@@ -1,0 +1,145 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: EventBridge rule for DynamoDB Health routed to Log Group with custom metric and alarm that sends SNS notification to email.
+
+Parameters:
+  NotificationEmail:
+    Type: String
+    Description: Email address to receive DynamoDB health alarm notifications
+
+Resources:
+
+  # ---------------------------
+  # SNS Topic and Subscription
+  # ---------------------------
+  DynamoDBHealthSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: DynamoDBHealthAlarmTopic
+      DisplayName: DynamoDB Health Alarm Notifications
+
+  DynamoDBHealthSNSTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+      TopicArn: !Ref DynamoDBHealthSNSTopic
+
+  # ---------------------------
+  # Log Group for AWS Health Events
+  # ---------------------------
+  HealthDynamoDBLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/events/DynamoDBServiceHealth
+      RetentionInDays: 14
+
+  # ---------------------------
+  # IAM Role for EventBridge Target
+  # ---------------------------
+  EventBridgeTargetRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: DynamoDBHealthEventTargetRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AllowPutLogEvents
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:PutLogEvents
+                  - logs:CreateLogStream
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: !GetAtt HealthDynamoDBLogGroup.Arn
+
+  # ---------------------------
+  # EventBridge Rule to Capture AWS Health Events
+  # ---------------------------
+  HealthDynamoDBEventRule:
+    DependsOn:
+      - EventBridgeTargetRole
+      - HealthDynamoDBLogGroup
+    Type: AWS::Events::Rule
+    Properties:
+      Name: DynamoDBServiceHealthMonitor
+      Description: Detect AWS Health DynamoDB issues and log them
+      State: ENABLED
+      EventBusName: default
+      EventPattern:
+        source:
+          - "aws.health"
+        detail-type:
+          - "AWS Health Event"
+        detail:
+          service:
+            - "DynamoDB"
+          eventTypeCategory:
+            - "issue"
+          eventTypeCode:
+            - "AWS_DYNAMODB_API_ISSUE"
+            - "AWS_DYNAMODB_OPERATIONAL_ISSUE"
+            - "AWS_DYNAMODB_INCREASED_READ_LATENCY"
+            - "AWS_DYNAMODB_INCREASED_WRITE_LATENCY"
+            - "AWS_DYNAMODB_INCREASED_ERROR_RATES"
+      Targets:
+        - Arn: !GetAtt HealthDynamoDBLogGroup.Arn
+          Id: DynamoDBHealthLogGroupTarget
+
+  # ---------------------------
+  # Metric Filter to Generate Custom Metric
+  # ---------------------------
+  DynamoDBHealthMetricFilter:
+    DependsOn: HealthDynamoDBLogGroup
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: /aws/events/DynamoDBServiceHealth
+      FilterPattern: '{ $.detail.eventTypeCode = "AWS_DYNAMODB_API_ISSUE" || $.detail.eventTypeCode = "AWS_DYNAMODB_OPERATIONAL_ISSUE" || $.detail.eventTypeCode = "AWS_DYNAMODB_INCREASED_READ_LATENCY" || $.detail.eventTypeCode = "AWS_DYNAMODB_INCREASED_WRITE_LATENCY" || $.detail.eventTypeCode = "AWS_DYNAMODB_INCREASED_ERROR_RATES" }'
+      MetricTransformations:
+        - MetricValue: '1'
+          MetricNamespace: 'Custom/AWSHealth'
+          MetricName: 'DynamoDBHealthOutageCount'
+
+  # ---------------------------
+  # CloudWatch Alarm
+  # ---------------------------
+  DynamoDBHealthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: DynamoDBServiceHealthAlarm
+      AlarmDescription: 'Alarm for DynamoDB Health issues via AWS Health events'
+      Namespace: 'Custom/AWSHealth'
+      MetricName: 'DynamoDBHealthOutageCount'
+      Statistic: Sum
+      Period: 300 # 5 minutes
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DynamoDBHealthSNSTopic
+      OKActions:
+        - !Ref DynamoDBHealthSNSTopic
+      InsufficientDataActions:
+        - !Ref DynamoDBHealthSNSTopic
+
+Outputs:
+
+  DynamoDBHealthAlarmName:
+    Description: The CloudWatch alarm for DynamoDB Health events
+    Value: !Ref DynamoDBHealthAlarm
+
+  DynamoDBHealthSNSTopicArn:
+    Description: SNS Topic ARN for DynamoDB Health notifications
+    Value: !Ref DynamoDBHealthSNSTopic
+
+  NotificationEmailConfirm:
+    Description: You must confirm the subscription email before receiving notifications
+    Value: !Ref NotificationEmail
